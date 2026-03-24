@@ -1,64 +1,160 @@
-import mysql.connector as db
 import json
+from pathlib import Path
 
-with open('keys.json') as json_file:
+import mysql.connector as db
+
+
+BASE_DIR = Path(__file__).resolve().parent
+KEYS_PATH = BASE_DIR / "keys.json"
+
+with KEYS_PATH.open(encoding="utf-8") as json_file:
     keys = json.load(json_file)
 
-def convertToBinaryData(filename):
+
+def get_connection():
+    return db.connect(**keys)
+
+
+def testConnection():
+    connection = None
     try:
-        with open(filename, 'rb') as file:
-            binaryData = file.read()
-        return binaryData
-    except:
-        return 0
+        connection = get_connection()
+        if connection.is_connected():
+            server = connection.get_server_info()
+            database_name = connection.database
+            return True, f"Conectado a {database_name} en MySQL {server}"
+        return False, "La conexion no quedo activa."
+    except db.Error as error:
+        return False, str(error)
+    finally:
+        if connection and connection.is_connected():
+            connection.close()
+
+
+def convert_to_binary_data(filename):
+    try:
+        with open(filename, "rb") as file:
+            return file.read()
+    except OSError:
+        return None
+
 
 def write_file(data, path):
-    with open(path, 'wb') as file:
+    with open(path, "wb") as file:
         file.write(data)
 
+
 def registerUser(name, photo):
-    id = 0
+    user_id = 0
     inserted = 0
+    connection = None
+    cursor = None
 
     try:
-        con = db.connect(host="localhost", user="root", password="", database="agency")
-        cursor = con.cursor()
+        connection = get_connection()
+        cursor = connection.cursor()
         sql = "INSERT INTO `user`(name, photo) VALUES (%s,%s)"
-        pic = convertToBinaryData(photo)
+        picture = convert_to_binary_data(photo)
 
-        if pic:
-            cursor.execute(sql, (name, pic))
-            con.commit()
+        if picture is not None:
+            cursor.execute(sql, (name, picture))
+            connection.commit()
             inserted = cursor.rowcount
-            id = cursor.lastrowid
-    except db.Error as e:
-        print(f"Failed inserting image: {e}")
+            user_id = cursor.lastrowid
+    except db.Error as error:
+        print(f"Failed inserting image: {error}")
     finally:
-        if con.is_connected():
+        if cursor is not None:
             cursor.close()
-            con.close()
-    return {"id": id, "affected": inserted}
+        if connection and connection.is_connected():
+            connection.close()
+    return {"id": user_id, "affected": inserted}
+
 
 def getUser(name, path):
-    id = 0
+    user_id = 0
     rows = 0
+    connection = None
+    cursor = None
 
     try:
-        con = db.connect(host="localhost", user="root", password="", database="agency")
-        cursor = con.cursor()
+        connection = get_connection()
+        cursor = connection.cursor()
         sql = "SELECT * FROM `user` WHERE name = %s"
 
         cursor.execute(sql, (name,))
         records = cursor.fetchall()
 
         for row in records:
-            id = row[0]
+            user_id = row[0]
             write_file(row[2], path)
         rows = len(records)
-    except db.Error as e:
-        print(f"Failed to read image: {e}")
+    except db.Error as error:
+        print(f"Failed to read image: {error}")
     finally:
-        if con.is_connected():
+        if cursor is not None:
             cursor.close()
-            con.close()
-    return {"id": id, "affected": rows}
+        if connection and connection.is_connected():
+            connection.close()
+    return {"id": user_id, "affected": rows}
+
+
+def getAllUsers():
+    users = []
+    connection = None
+    cursor = None
+
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute("SELECT idUser AS id, name FROM `user` ORDER BY idUser ASC")
+        users = cursor.fetchall()
+    except db.Error as error:
+        print(f"Failed listing users: {error}")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+    return users
+
+
+def deleteUser(name):
+    deleted = 0
+    connection = None
+    cursor = None
+
+    try:
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute("DELETE FROM `user` WHERE name = %s", (name,))
+        connection.commit()
+        deleted = cursor.rowcount
+    except db.Error as error:
+        print(f"Failed deleting user: {error}")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+    return {"affected": deleted}
+
+
+def test_connection():
+    return testConnection()
+
+
+def register_user(name, photo):
+    return registerUser(name, photo)
+
+
+def get_user(name, path):
+    return getUser(name, path)
+
+
+def get_all_users():
+    return getAllUsers()
+
+
+def delete_user(name):
+    return deleteUser(name)
