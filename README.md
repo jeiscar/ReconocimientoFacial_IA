@@ -268,15 +268,72 @@ Si FRR alto (muchos falsos negativos):
   → Mejorar iluminación de captura
 ```
 
-### Ejecutar la aplicación
+## 🚀 Ejecutar la Aplicación
+
+**Paso 1: Verificar cámara (RECOMENDADO)**
+```bash
+python test_camera.py
+```
+
+**Paso 2: Iniciar la aplicación**
 ```bash
 python facial_recognition.py
 ```
 
-La interfaz mostrará:
+**La interfaz mostrará:**
 - **Estado de BD:** conexión a MySQL
-- **Botones principales:** Registrar, Reconocer, Entrenar, Gestionar
-- Todas las peticiones de la GUI se procesan en la BD de forma sincróna
+- **Estado del modelo:** cantidad de personas entrenadas
+- **Botones principales:** Registrar, Entrenar, Tomar asistencia, Gestionar usuarios
+- Todas las operaciones se procesan en la BD de forma síncrona
+
+## 🔧 Verificación y Diagnóstico
+
+### Probar la cámara ANTES de abrir la app
+
+**Ejecuta el script de diagnóstico:**
+```bash
+python test_camera.py
+```
+
+**El script verifica:**
+- ✓ Si la cámara se puede abrir
+- ✓ Si se pueden leer 30 frames consecutivos
+- ✓ Resolución y FPS actual
+- ✓ Detecta si hay problemas (MSMF, permisos, ocupada, etc.)
+
+**Resultado esperado:**
+```
+============================================================
+DIAGNÓSTICO DE CÁMARA
+============================================================
+
+[1] Intentando abrir cámara (device 0)...
+    ✓ Cámara abierta correctamente
+
+[2] Configurando parámetros de cámara...
+    ✓ Parámetros configurados
+
+[3] Intentando leer 30 frames...
+    ✓ 10 frames leídos correctamente
+    ✓ 20 frames leídos correctamente
+    ✓ 30 frames leídos correctamente
+
+    Resultado: 30/30 frames leídos exitosamente
+    ✓ La cámara funciona correctamente
+
+[4] Propiedades de la cámara:
+    - Resolución: 640 x 480
+    - FPS: 20.0
+
+✓ La cámara está LISTA para usar la aplicación
+============================================================
+```
+
+**Si falla:**
+- El script ofrecerá soluciones específicas
+- Típicamente: cierra Teams/Zoom/OBS y reintenta
+
+---
 
 ### 🔹 Flujo 1: Registrar Nuevo Usuario
 
@@ -382,6 +439,7 @@ ReconocimientoFacial_IA/
 ├── facial_recognition.py  # Aplicación principal (GUI + lógica ML)
 ├── database.py            # Gestor de conexión MySQL
 ├── restore_db.py          # Utilidad: re-registra usuarios desde dataset/ si la BD fue limpiada
+├── test_camera.py         # Diagnóstico: verifica que la cámara funciona correctamente
 ├── script.sql             # Script de creación de BD
 ├── keys.json              # Credenciales (gitignored)
 ├── README.md              # Documentación
@@ -784,17 +842,55 @@ pip install --upgrade opencv-python
 pip freeze | grep opencv
 ```
 
-### Error: "No faces detected"
+### Error: Problemas con la cámara (MSMF)
+
+**Síntoma:**
+```
+[ WARN:0@17.352] global cap_msmf.cpp:488 `anonymous-namespace'::SourceReaderCB::OnReadSample 
+videoio(MSMF): async ReadSample() call is failed with error status: -1072873854
+[ WARN:1@17.352] global cap_msmf.cpp:1815 CvCapture_MSMF::grabFrame videoio(MSMF): 
+can't grab frame. Error: -1072873854
+```
+
+Este error de MSMF (Media Source Module Format) en Windows indica que **la cámara no está disponible** o está siendo usada por otra aplicación.
+
+**Soluciones rápidas:**
+
+1. **Verifica que la cámara funciona (diagnóstico):**
+   ```bash
+   python test_camera.py
+   ```
+   Este script prueba 30 frames y te dice si la cámara está OK.
+
+2. **Cierra otras aplicaciones que usan cámara:**
+   ```powershell
+   # Teams, Zoom, WhatsApp, OBS, Edge con videollamadas, etc.
+   Get-Process teams, zoom, skype, obs64 | Stop-Process -Force 2>/dev/null
+   ```
+
+3. **Si falla el test, reinicia la cámara:**
+   - Administrador de dispositivos → Cámaras → Click derecho → Desinstalar
+   - Reinicia la computadora
+   - Verifica que no hay otro proceso usando `/dev/video0` (Linux) o MSMF (Windows)
+
+4. **Última opción: Reinicia todo**
+   ```powershell
+   Restart-Computer
+   ```
+
+---
+
+### Error: "No faces detected" o problemas de iluminación
 
 **Causas y soluciones:**
 
 | Causa | Solución |
 |-------|----------|
 | Iluminación pobre | Aumentar luz frontal, evitar contraluz |
-| Rostro muy pequeño en frame | Acercarse a la cámara |
+| Rostro muy pequeño en frame | Acercarse a la cámara (40-70 cm recomendado) |
 | Ángulo extremo | Mirar hacia la cámara (máx 45° de ángulo) |
 | Rostro parcialmente cubierto | Quitar buffanda, gafas de sol, barbijo |
-| Problema de cámara | Probar con otra app (WhatsApp camera), reiniciar |
+| Problema de cámara | Ejecutar `python test_camera.py` para diagnosticar |
 
 ### La comparación siempre falla (Desconocido)
 

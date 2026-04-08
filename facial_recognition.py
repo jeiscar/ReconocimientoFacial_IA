@@ -47,6 +47,13 @@ RED    = "#e74c3c"
 YELLOW = "#f39c12"
 FONT   = "Century Gothic"
 
+# Colores en formato BGR para OpenCV
+CV_GREEN = (0, 200, 80)      # Verde
+CV_RED = (60, 60, 220)       # Rojo
+CV_BLUE = (200, 60, 60)      # Azul
+CV_ORANGE = (0, 165, 255)    # Naranja
+CV_WHITE = (200, 200, 200)   # Blanco
+
 os.makedirs(DATASET_PATH, exist_ok=True)
 os.makedirs("model",      exist_ok=True)
 os.makedirs(TEMP_PATH,    exist_ok=True)
@@ -141,11 +148,15 @@ def validate_image_quality(img_gray, w, h):
 
 
 def setup_camera(cap):
-    # Ajustes base para estabilizar lectura en webcams integradas.
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    """Ajustes base para estabilizar lectura en webcams integradas."""
+    try:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        print("[CAM] Configuración de cámara aplicada correctamente")
+    except Exception as e:
+        print(f"[CAM] Advertencia al configurar cámara: {e}")
 
 # ──────────────────────────────────────────────
 #  MODELO
@@ -403,10 +414,22 @@ def open_capture_screen():
         progress["maximum"] = total
         progress["value"]   = 0
 
+        frames_failed = 0
         while captured < total:
             ret, frame = cap.read()
             if not ret:
-                break
+                frames_failed += 1
+                # Reintentar unos pocos frames antes de abandonar
+                if frames_failed > 30:
+                    print(f"[CAM] Error: No se pueden leer frames después de 30 intentos.")
+                    status.config(
+                        text="Error de cámara: No se puede leer frames.\n"
+                             "Cierra otras apps que usan la cámara y reintenta.",
+                        fg=RED)
+                    break
+                continue
+            
+            frames_failed = 0  # Reiniciar contador si conseguimos un frame
 
             display = frame.copy()
             rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -568,11 +591,18 @@ ESC para cerrar"""
         attendance_marked = False
         last_valid_score = 0.0
         last_valid_margin = 0.0
+        frames_failed = 0
 
         while True:
             ret, frame = cap.read()
             if not ret:
-                break
+                frames_failed += 1
+                if frames_failed > 30:
+                    print(f"[CAM] Error: No se pueden leer frames después de 30 intentos.")
+                    break
+                continue
+            
+            frames_failed = 0
 
             results = verify_claimed_id(frame, model, claimed_id)
 
@@ -584,7 +614,7 @@ ESC para cerrar"""
                     last_valid_score = score
                     last_valid_margin = margin
                     cv2.putText(frame, f"Frames OK: {consecutive_valid}/{CONSENSUS_FRAMES}",
-                                (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, GREEN, 2)
+                                (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, CV_GREEN, 2)
                 else:
                     consecutive_valid = 0
             else:
