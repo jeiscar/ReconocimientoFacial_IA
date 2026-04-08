@@ -140,6 +140,59 @@ def deleteUser(name):
     return {"affected": deleted}
 
 
+def recordAttendance(student_id, similarity_score, margin_score, frames_consensus, quality_check="OK"):
+    """Registra asistencia verificada en tabla de auditoría."""
+    attendance_id = 0
+    inserted = 0
+    connection = None
+    cursor = None
+
+    try:
+        connection = get_connection()
+        cursor = connection.cursor()
+        sql = """INSERT INTO attendance 
+                 (student_id, similarity_score, margin_score, frames_consensus, quality_check, status)
+                 VALUES (%s, %s, %s, %s, %s, 'VERIFIED')"""
+        
+        cursor.execute(sql, (student_id, similarity_score, margin_score, frames_consensus, quality_check))
+        connection.commit()
+        inserted = cursor.rowcount
+        attendance_id = cursor.lastrowid
+    except db.Error as error:
+        print(f"Failed recording attendance: {error}")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+    return {"id": attendance_id, "affected": inserted}
+
+
+def getAttendanceToday(student_id):
+    """Obtiene registros de asistencia del día actual para un estudiante."""
+    records = []
+    connection = None
+    cursor = None
+
+    try:
+        connection = get_connection()
+        cursor = connection.cursor(dictionary=True)
+        sql = """SELECT * FROM attendance 
+                 WHERE student_id = %s AND DATE(timestamp) = CURDATE()
+                 ORDER BY timestamp DESC"""
+        
+        cursor.execute(sql, (student_id,))
+        records = cursor.fetchall()
+    except db.Error as error:
+        print(f"Failed retrieving attendance: {error}")
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if connection and connection.is_connected():
+            connection.close()
+    return records
+
+
 def test_connection():
     return testConnection()
 
@@ -158,3 +211,7 @@ def get_all_users():
 
 def delete_user(name):
     return deleteUser(name)
+
+
+def record_attendance(student_id, similarity_score, margin_score, frames_consensus, quality_check="OK"):
+    return recordAttendance(student_id, similarity_score, margin_score, frames_consensus, quality_check)

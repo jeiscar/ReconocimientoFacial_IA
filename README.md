@@ -18,7 +18,7 @@ Aplicativo de escritorio que permite:
 - **Extracción de características** con ORB (Oriented FAST and Rotated BRIEF)
 - **Entrenamiento incremental** del modelo sin necesidad de GPU
 - **Múltiples imágenes por usuario** (por defecto 30, configurable 5-200)
-- **Similitud adaptativa** por usuario (0.55 de umbral configurado)
+- **Similitud adaptativa** por usuario (0.66 de umbral configurado)
 - **Almacenamiento eficiente**: archivos locales + BD con referencia
 - **Manejo robusto** de conexiones MySQL con cierre seguro
 - **Feedback visual** en tiempo real durante captura y reconocimiento
@@ -143,7 +143,130 @@ ReconocimientoFacial_IA/
 └── README.md            # Documentación
 ```
 
-## ▶️ Uso de la Aplicación
+## ✅ Criterios de Validación Mejorados (v2.1)
+
+Para garantizar **máxima precisión y seguridad** en la toma de asistencia, el sistema implementa múltiples capas de validación:
+
+### 1️⃣ **Validación Estructural**
+
+| Criterio | Valor | Propósito |
+|----------|-------|----------|
+| **Caras permitidas** | Exactamente 1 | Evita suplantación con otros en frame |
+| **Error si múltiples** | > 1 rostro | Bloquea reconocimiento en grupo |
+| **Error si ninguna** | 0 rostros | Previene validación sin cara |
+
+### 2️⃣ **Validación de Calidad de Imagen**
+
+```
+Test de blur (Laplaciano variance):
+  ✓ OK: > 20.0  (imagen aceptable para webcam integrada)
+  ✗ FALLA: < 20  (imagen borrosa)
+  
+Test de brillo:
+  ✓ OK: 30-230 (rango aceptable)
+  ✗ FALLA: < 30  (muy oscura)
+  ✗ FALLA: > 230 (muy clara/saturada)
+  
+Test de tamaño de rostro:
+  ✓ OK: > 80×80 px (rostro grande)
+  ✗ FALLA: < 80×80 (rostro muy pequeño)
+```
+
+**Indicador visual:**
+- 🟢 Verde: Criterios OK, esperando consenso
+- 🟠 Naranja: Error de calidad (especifica motivo)
+- 🔴 Rojo: Múltiples caras / No identificado
+- 🔵 Azul: No hay cara
+
+### 3️⃣ **Umbrales de Similitud (Perfil HP HD Camara)**
+
+```
+Similitud (S):       >= 66%   [perfil camara basica]
+Margen anti-impostor (M): >= 12%
+Min. coincidencias:  >= 30
+```
+
+**Fórmula de aceptación:**
+```
+ASISTENCIA_OK = (Similitud >= 66%) AND (Margen >= 12%) AND (Caras == 1) AND (Calidad = OK)
+```
+
+### 4️⃣ **Consenso Temporal (Anti-Ruido)**
+
+```
+Requeridos: 12 frames consecutivos válidos
+Tiempo aprox: 0.3-0.5 segundos a 30 FPS
+Ventaja: 1 frame falso no marca asistencia
+```
+
+### 4.1️⃣ Recomendaciones para webcam HP HD
+
+- Usar luz frontal fija (evitar contraluz de ventana).
+- Distancia recomendada de rostro: 40-70 cm.
+- Mantener el rostro centrado y estable por ~1 segundo.
+- Capturar registro con 50-80 fotos por estudiante en distintos dias.
+- Reentrenar el modelo despues de agregar nuevas fotos.
+
+**Flujo:**
+1. Frame 1 válido → contador = 1
+2. Frame 2 válido → contador = 2
+3. ... (continúa si todos válidos)
+4. Frame 12 válido → **ASISTENCIA REGISTRADA**
+5. Si un frame falla → contador se reinicia a 0
+
+### 5️⃣ **Auditoría Completa en Base de Datos**
+
+Cada asistencia registrada contiene:
+```sql
+INSERT INTO attendance (
+  student_id,        -- ID ingresado por usuario
+  similarity_score,   -- 70% ej.
+  margin_score,       -- 15% ej.
+  frames_consensus,   -- 10 frames
+  quality_check,      -- "OK"
+  status,             -- "VERIFIED"
+  timestamp           -- 2024-03-24 15:32:05
+)
+```
+
+**Beneficios:**
+- Trazabilidad total
+- Revisión de resultados cuestionables
+- Análisis histórico de precisión
+- Detectar patrones de fallos
+
+---
+
+## 📊 Protocolo de Calibración Recomendado
+
+Antes de usar en producción, valida precisión con tus estudiantes:
+
+### Paso 1: Dataset de Validación
+```
+Por cada estudiante capturar:
+- 50-80 fotos en registro (variación de luz, gafas, expresión)
+- 10-15 fotos de prueba (no usadas en entrenamiento)
+- Entrena con las primeras 50
+```
+
+### Paso 2: Medir Métricas
+```
+FAR (False Acceptance Rate) = Impostores aceptados / Total impostores
+FRR (False Rejection Rate) = Legítimos rechazados / Total legítimos
+EER (Equal Error Rate) = punto donde FAR = FRR (objetivo < 2%)
+```
+
+### Paso 3: Ajustar si es necesario
+```
+Si FAR alto (muchos falsos positivos):
+  → Aumentar SIMILARITY_MIN a 0.75 o 0.80
+  → Aumentar VERIFY_MARGIN a 0.18 o 0.20
+
+Si FRR alto (muchos falsos negativos):
+  → Reducir SIMILARITY_MIN a 0.65
+  → Aumentar cantidad de fotos por estudiante a 80-100
+  → Mejorar iluminación de captura
+```
 
 ### Ejecutar la aplicación
 ```bash
@@ -181,31 +304,37 @@ La interfaz mostrará:
    - Lee todas las carpetas en `dataset/`
    - Por cada usuario y cada imagen:
      - Convierte a escala de grises
-     - Extrae descriptores ORB (500 características por imagen)
+     - Extrae descriptores ORB (700 características por imagen)
      - Guarda descriptores en diccionario por usuario
    - Serializa todo en `model/orb_model.pkl` (pickle)
 3. **Resultado:** "Modelo entrenado: 5 persona(s), 145 imagen(es)"
 4. **El modelo estará listo para predicción**
 
 **Detalles técnicos:**
-- Cada imagen produce ~500 descriptores (ORB)
+- Cada imagen produce hasta 700 descriptores (ORB)
 - Cada usuario tendrá lista de descriptores: `[desc_img1, desc_img2, ..., desc_imgN]`
-- Total datos del modelo = usuarios × imágenes × 500 características
+- Total datos del modelo = usuarios × imágenes × 700 características
 - Tamaño típico: 2-5 usuarios, 30 imágenes c/u = ~5 MB archivo .pkl
 
-### 🔹 Flujo 3: Reconocer Usuario (Login Facial)
+### 🔹 Flujo 3: Tomar Asistencia (Verificación por ID)
 
-1. **Clic en "Reconocer"** → Se abre ventana de predicción
-2. **Se activa la webcam en tiempo real**
-3. **Sistema detecta rostros y compara:**
-   - Extrae descriptores ORB del rostro en vivo
-   - Compara contra todos los descriptores del modelo
-   - Calcula similitud promedio por usuario
-   - Filtra por umbral mínimo (0.55 = 55%)
-4. **Resultado en pantalla:**
-   - ✓ Verde: "Juan García (92%)" → Usuario autenticado
-   - ✗ Rojo: "Desconocido (23%)" → No reconocido
-5. **Presiona ESC** para salir
+1. **Clic en "Tomar asistencia (verificar ID)"** → Se abre ventana de verificación
+2. **Ingresa el ID del estudiante** en el campo de texto
+3. **Presiona "Iniciar reconocimiento"** → Se activa la webcam
+4. **Sistema aplica verificación 1:1 estricta:**
+   - Solo acepta exactamente **1 cara** en el frame
+   - Valida calidad: blur (`< 20`), brillo (`30-230`), tamaño rosotro (`> 80px`)
+   - Extrae descriptores ORB y compara contra el ID reclamado
+   - Calcula similitud (`S`) y margen anti-impostor (`M = S_claimed - S_best_other`)
+   - Acepta solo si `S >= 66%` AND `M >= 12%`
+5. **Consenso temporal:** requiere 12 frames consecutivos válidos
+6. **Al alcanzar consenso:**
+   - ✓ Verde: `ID XXXX | ASISTENCIA OK | S:XX% M:XX%`
+   - Se muestra popup de confirmación
+   - Se registra en tabla `attendance` de la BD (score, margen, frames, timestamp)
+7. **Presiona ESC** para salir
+
+> ⚠️ El sistema **no tiene liveness detection**. Una foto impresa podría pasar la validación si tiene calidad suficiente. Para entornos críticos se recomienda agregar detección de parpadeo (blink detection).
 
 ### 🔹 Flujo 4: Gestionar Usuarios
 
@@ -230,18 +359,18 @@ IMG_SIZE = (150, 200)
 DEFAULT_PHOTOS = 30
 
 # Características de ORB a extraer
-ORB_FEATURES = 500
+ORB_FEATURES = 700
 
 # Umbral de distancia en matching ORB
 MATCH_THRESHOLD = 70
 
 # Similitud mínima para considerar como reconocido
-SIMILARITY_MIN = 0.55  # 55%
+SIMILARITY_MIN = 0.66  # 66%
 ```
 
 **Ajustes recomendados:**
-- **Aumentar SIMILARITY_MIN a 0.65** si hay falsos positivos
-- **Reducir a 0.45** si hay muchos falsos negativos
+- **Aumentar SIMILARITY_MIN a 0.75** si hay falsos positivos
+- **Reducir a 0.55** si hay muchos falsos negativos (y más fotos por usuario)
 - **Aumentar ORB_FEATURES a 1000** para mayor precisión (pero más lento)
 - **IMG_SIZE más grande** = mejor información pero más lentitud
 
@@ -252,6 +381,7 @@ ReconocimientoFacial_IA/
 │
 ├── facial_recognition.py  # Aplicación principal (GUI + lógica ML)
 ├── database.py            # Gestor de conexión MySQL
+├── restore_db.py          # Utilidad: re-registra usuarios desde dataset/ si la BD fue limpiada
 ├── script.sql             # Script de creación de BD
 ├── keys.json              # Credenciales (gitignored)
 ├── README.md              # Documentación
@@ -371,10 +501,10 @@ def detect_and_crop(frame_bgr):
 
 **Parámetros de extracción:**
 ```python
-orb = cv2.ORB_create(nfeatures=500)  # 500 características por imagen
+orb = cv2.ORB_create(nfeatures=700)  # 700 características por imagen
 kp, descriptors = orb.detectAndCompute(gray_image, None)
-# kp: 500 keypoints (x, y, ángulo, escala)
-# descriptors: shape (500, 32) - cada descriptor = 256 bits
+# kp: hasta 700 keypoints (x, y, ángulo, escala)
+# descriptors: shape (N, 32) - cada descriptor = 256 bits
 ```
 
 **Tamaño del modelo ejemplos:**
@@ -420,7 +550,7 @@ kp, descriptors = orb.detectAndCompute(gray_image, None)
              ▼
 ┌────────────────────────────────────────────────────┐
 │ best_user = argmax(promedios)                      │
-│ if best_score < SIMILARITY_MIN (0.55):            │
+│ if best_score < SIMILARITY_MIN (0.66):            │
 │     → "Desconocido"                               │
 │ else:                                              │
 │     → "Nombre_Usuario (XX%)"                      │
@@ -471,17 +601,32 @@ CREATE TABLE user (
     photo LONGBLOB NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE attendance (
+    idAttendance INT AUTO_INCREMENT PRIMARY KEY,
+    student_id   VARCHAR(100) NOT NULL,
+    timestamp    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    similarity_score  FLOAT NOT NULL,
+    margin_score      FLOAT NOT NULL,
+    frames_consensus  INT NOT NULL,
+    quality_check     VARCHAR(50),
+    status ENUM('VERIFIED', 'REJECTED', 'QUALITY_ERROR') DEFAULT 'VERIFIED',
+    INDEX idx_student_id (student_id),
+    INDEX idx_timestamp  (timestamp)
+);
 ```
 
 **Operaciones:**
 
 | Operación | Función | Datos |
 |-----------|---------|--------|
-| Guardar referencia | `registerUser(name, photo_path)` | Inserta 1ª imagen como BLOB |
+| Guardar referencia | `registerUser(name, photo_path)` | Inserta 1ª imagen como BLOB (sin duplicar) |
 | Recuperar referencia | `getUser(name, output_path)` | Extrae foto de BD, escribe a disco |
 | Listar usuarios | `getAllUsers()` | SELECT id, name (sin fotos) |
 | Eliminar usuario | `deleteUser(name)` | DELETE (archivos en disco se limpian manualmente) |
 | Verificar conexión | `testConnection()` | Conexión de prueba sin escritura |
+| Registrar asistencia | `recordAttendance(student_id, score, margin, frames)` | INSERT en tabla `attendance` |
+| Asistencia hoy | `getAttendanceToday(student_id)` | SELECT por fecha actual |
 
 **Manejo de conexiones (CRÍTICO):**
 ```python
@@ -671,7 +816,7 @@ pip freeze | grep opencv
 3. **Bajar umbral de similitud:**
    ```python
    # En facial_recognition.py
-   SIMILARITY_MIN = 0.45  # (en lugar de 0.55)
+   SIMILARITY_MIN = 0.55  # (en lugar de 0.66 por defecto)
    ```
 
 4. **Verificar que está en modo predicción:**
@@ -781,26 +926,30 @@ F1-Score = 2 * (Precision * Recall) / (Precision + Recall)
 
 ## 📋 Roadmap
 
-### ✅ v1.0 (Actual)
-- ✓ Registro multi-imagen (5-200 fotos)
-- ✓ Entrenamiento ORB incremental
-- ✓ Reconocimiento en vivo
-- ✓ BD MySQL con referencia
+### ✅ v2.1 (Actual)
+- ✓ Registro multi-imagen (5-200 fotos, sin duplicados en BD)
+- ✓ Entrenamiento ORB incremental (700 features, CLAHE + GaussianBlur)
+- ✓ Verificación 1:1 por ID de estudiante (no reconocimiento abierto)
+- ✓ Validación de calidad: blur / brillo / tamaño de rostro
+- ✓ Consenso temporal: 12 frames consecutivos válidos
+- ✓ Auditoría completa en tabla `attendance` (score, margen, frames, timestamp)
+- ✓ Anti-impostor: margen mínimo entre candidatos
+- ✓ BD MySQL con referencia de foto y anti-duplicados
 - ✓ Interfaz Tkinter completa
+- ✓ `restore_db.py`: restaura BD desde dataset local
 
-### 🔄 v2.0 (Próxima)
+### 🔄 v3.0 (Próxima)
+- [ ] Liveness detection (blink detection con MediaPipe)
+- [ ] Exportar asistencia a CSV/Excel
+- [ ] Cooldown efectivo: bloquear re-registro dentro de 5 min
 - [ ] Interfaz web (Flask/Django)
-- [ ] Exportar asistencia a Excel
-- [ ] Logging y auditoría de accesos
-- [ ] Reconocimiento multi-rostro
-- [ ] Re-entrenamiento automático
+- [ ] Logging centralizado de intentos fallidos
 
-### 🎯 v3.0 (Mediano Plazo)
+### 🎯 v4.0 (Mediano Plazo)
 - [ ] Migración a FaceNet (99%+ precisión)
-- [ ] Detección de vida (liveness)
-- [ ] API REST
-- [ ] Encriptación E2E
-- [ ] Dashboard de estadísticas
+- [ ] API REST para integración con SIS
+- [ ] Encriptación AES-256 de imágenes en BD
+- [ ] Dashboard de estadísticas en tiempo real
 
 ### 🚀 v4.0 (Producción)
 - [ ] Cloud deployment (Azure/AWS)

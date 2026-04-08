@@ -20,9 +20,23 @@ MODEL_PATH      = "model/orb_model.pkl"
 TEMP_PATH       = "temp/"
 IMG_SIZE        = (150, 200)
 DEFAULT_PHOTOS  = 30
-ORB_FEATURES    = 500
+ORB_FEATURES    = 700
 MATCH_THRESHOLD = 70
-SIMILARITY_MIN  = 0.55
+# Umbrales ESTRICTOS para asistencia (validación mejorada)
+SIMILARITY_MIN  = 0.66  # Perfil HP HD: balance entre precision y rechazo
+MIN_MATCHES     = 30    # Menor exigencia por menor detalle de camara
+VERIFY_MARGIN   = 0.12  # Mantiene separacion anti-impostor
+# Validacion de calidad de imagen
+BLUR_THRESHOLD  = 20.0  # Umbral bajo para webcams integradas de baja resolución
+BRIGHTNESS_MIN  = 30    # Brillo minimo (0-255)
+BRIGHTNESS_MAX  = 230   # Brillo maximo (0-255)
+FACE_SIZE_MIN   = 80    # Tamaño minimo de rostro en pixeles
+CONSENSUS_FRAMES = 12   # Compensa umbral mas flexible en camara basica
+COOLDOWN_SECONDS = 300  # Cooldown de 5 min para no duplicar asistencia
+
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+CAMERA_FPS = 20
 
 BG     = "#151515"
 HEADER = "#101010"
@@ -66,6 +80,13 @@ def compute_descriptors(img_gray):
     _, des = orb.detectAndCompute(img_gray, None)
     return des
 
+
+def preprocess_face_gray(img_gray):
+    # CLAHE mejora contraste local en imagenes de webcam de baja calidad.
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(img_gray)
+    return cv2.GaussianBlur(enhanced, (3, 3), 0)
+
 def similarity(des1, des2):
     if des1 is None or des2 is None:
         return 0.0
@@ -74,7 +95,57 @@ def similarity(des1, des2):
     if not matches:
         return 0.0
     good = [m for m in matches if m.distance < MATCH_THRESHOLD]
-    return len(good) / len(matches)
+    # Penaliza coincidencias con pocos matches para evitar falsos positivos.
+    raw = len(good) / len(matches)
+    confidence = min(1.0, len(matches) / float(MIN_MATCHES))
+    return raw * confidence
+
+
+def person_score(des_query, des_list):
+    scores = [similarity(des_query, d) for d in des_list]
+    valid = [s for s in scores if s > 0]
+    if not valid:
+        return 0.0
+    # Media de las mejores coincidencias para mayor robustez.
+    top_k = sorted(valid, reverse=True)[:5]
+    return float(np.mean(top_k))
+
+# ──────────────────────────────────────────────
+#  VALIDACION DE IMAGEN
+# ──────────────────────────────────────────────
+
+def is_image_blurry(img_gray, threshold=BLUR_THRESHOLD):
+    """Detecta si una imagen esta borrosa usando varianza Laplaciana."""
+    laplacian_var = cv2.Laplacian(img_gray, cv2.CV_64F).var()
+    return laplacian_var < threshold
+
+def is_image_dark_or_bright(img_gray):
+    """Valida brillo de imagen."""
+    brightness = np.mean(img_gray)
+    return brightness < BRIGHTNESS_MIN or brightness > BRIGHTNESS_MAX
+
+def is_face_too_small(w, h):
+    """Valida tamaño minimo de rostro."""
+    face_area = w * h
+    return face_area < FACE_SIZE_MIN ** 2
+
+def validate_image_quality(img_gray, w, h):
+    """Retorna (is_valid, reason) para diagnostico."""
+    if is_image_blurry(img_gray):
+        return False, "Borrosa"
+    if is_image_dark_or_bright(img_gray):
+        return False, "Iluminacion"
+    if is_face_too_small(w, h):
+        return False, "Muy pequeno"
+    return True, "OK"
+
+
+def setup_camera(cap):
+    # Ajustes base para estabilizar lectura en webcams integradas.
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+    cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 # ──────────────────────────────────────────────
 #  MODELO
@@ -96,6 +167,7 @@ def train_model():
             gray = cv2.imread(os.path.join(folder, img_name), cv2.IMREAD_GRAYSCALE)
             if gray is None:
                 continue
+            gray = preprocess_face_gray(gray)
             des = compute_descriptors(gray)
             if des is not None:
                 descriptors.append(des)
@@ -128,12 +200,12 @@ def predict(frame_bgr, model):
         crop  = frame_bgr[y:y+h, x:x+w]
         crop  = cv2.resize(crop, IMG_SIZE, interpolation=cv2.INTER_CUBIC)
         gray  = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        gray = preprocess_face_gray(gray)
         des_q = compute_descriptors(gray)
 
         best_name, best_score = "Desconocido", 0.0
         for person, des_list in model.items():
-            scores = [similarity(des_q, d) for d in des_list]
-            avg    = float(np.mean(scores)) if scores else 0.0
+            avg = person_score(des_q, des_list)
             if avg > best_score:
                 best_score, best_name = avg, person
 
@@ -145,6 +217,73 @@ def predict(frame_bgr, model):
         cv2.putText(frame_bgr, f"{best_name} ({best_score:.0%})",
                     (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         results.append((best_name, best_score))
+
+    return results
+
+
+def verify_claimed_id(frame_bgr, model, claimed_id):
+    """Verifica identidad: una sola cara, calidad imagen, umbrales estrictos."""
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    faces = get_detector().detect_faces(rgb)
+    results = []
+
+    claimed_desc = model.get(claimed_id)
+    if not claimed_desc:
+        return results
+
+    # VALIDACION CRITICA: debe haber EXACTAMENTE una cara
+    if len(faces) == 0:
+        cv2.putText(frame_bgr, "NINGUNA CARA DETECTADA", (30, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (60, 60, 220), 2)
+        return results
+    if len(faces) > 1:
+        cv2.putText(frame_bgr, f"ERROR: {len(faces)} caras. Solo 1 persona.",
+                    (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        return results
+
+    face_data = faces[0]
+    x, y, w, h = face_data["box"]
+    x, y = max(0, x), max(0, y)
+    crop = frame_bgr[y:y+h, x:x+w]
+    crop = cv2.resize(crop, IMG_SIZE, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray = preprocess_face_gray(gray)
+
+    # VALIDACION DE CALIDAD: blur, brillo, tamaño
+    quality_ok, quality_msg = validate_image_quality(gray, w, h)
+    if not quality_ok:
+        color = (0, 165, 255)  # Naranja = error de calidad
+        cv2.rectangle(frame_bgr, (x, y), (x+w, y+h), color, 2)
+        cv2.putText(frame_bgr, f"CALIDAD: {quality_msg}",
+                    (x, y - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        return results
+
+    des_q = compute_descriptors(gray)
+
+    claimed_score = person_score(des_q, claimed_desc)
+    impostor_best = 0.0
+    for person, des_list in model.items():
+        if person == claimed_id:
+            continue
+        impostor_best = max(impostor_best, person_score(des_q, des_list))
+
+    margin = claimed_score - impostor_best
+    # Criterios ESTRICTOS: similitud >= 70% AND margen >= 15%
+    accepted = claimed_score >= SIMILARITY_MIN and margin >= VERIFY_MARGIN
+
+    color = (0, 200, 80) if accepted else (60, 60, 220)
+    state = "ASISTENCIA OK" if accepted else "NO VERIFICADO"
+    cv2.rectangle(frame_bgr, (x, y), (x+w, y+h), color, 2)
+    cv2.putText(
+        frame_bgr,
+        f"ID {claimed_id} | {state} | S:{claimed_score:.0%} M:{margin:.0%}",
+        (x, y - 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.58,
+        color,
+        2,
+    )
+    results.append((accepted, claimed_score, margin))
 
     return results
 
@@ -183,15 +322,15 @@ def check_db_status(label):
 
 def open_capture_screen():
     win = Toplevel(root)
-    win.title("Registrar persona")
+    win.title("Registrar estudiante")
     win.geometry("540x450")
     win.configure(bg=BG)
     win.resizable(False, False)
 
-    make_header(win, "Registrar persona")
+    make_header(win, "Registrar estudiante")
     spacer(win)
 
-    Label(win, text="Nombre del estudiante:", fg=WHITE, bg=BG, font=(FONT, 12)).pack()
+    Label(win, text="ID del estudiante:", fg=WHITE, bg=BG, font=(FONT, 12)).pack()
     name_var = StringVar()
     Entry(win, textvariable=name_var, justify=CENTER, font=(FONT, 12), width=30).pack(ipady=5)
     spacer(win)
@@ -211,6 +350,11 @@ def open_capture_screen():
         imgs = sorted(os.listdir(folder))
         if not imgs:
             return
+        # Evita duplicados: solo insertar si el nombre no existe en la BD
+        existing = db.getAllUsers()
+        if any(u["name"] == name for u in existing):
+            print(f"[DB] '{name}' ya existe en BD, no se duplica.")
+            return
         ref_path = os.path.join(folder, imgs[0])
         res = db.registerUser(name, ref_path)
         if res["affected"]:
@@ -223,7 +367,7 @@ def open_capture_screen():
         total = count_var.get()
 
         if not name:
-            status.config(text="Escribe el nombre del estudiante.", fg=RED)
+            status.config(text="Escribe el ID del estudiante.", fg=RED)
             return
 
         folder = os.path.join(DATASET_PATH, name)
@@ -237,18 +381,19 @@ def open_capture_screen():
         # Informar al usuario si ya tiene fotos
         if existing_count > 0:
             status.config(
-                text=f"'{name}' ya tiene {existing_count} foto(s).\n"
+                text=f"El ID '{name}' ya tiene {existing_count} foto(s).\n"
                      f"Se agregarán {total} foto(s) nuevas (total: {existing_count + total}).",
                 fg=YELLOW)
             win.update()
 
         cap = cv2.VideoCapture(0)
+        setup_camera(cap)
         if not cap.isOpened():
             status.config(text="No se pudo abrir la camara.", fg=RED)
             return
 
         status.config(
-            text=f"Capturando {total} fotos nuevas de '{name}'.\n"
+              text=f"Capturando {total} fotos nuevas para ID '{name}'.\n"
                  f"Ya existentes: {existing_count}  |  ESPACIO = capturar  |  ESC = cancelar",
             fg=YELLOW)
         win.update()
@@ -307,7 +452,7 @@ def open_capture_screen():
             save_reference_to_db(name, folder)
             total_acum = existing_count + captured
             status.config(
-                text=f"{captured} foto(s) nuevas agregadas para '{name}'.\n"
+                 text=f"{captured} foto(s) nuevas agregadas para ID '{name}'.\n"
                      f"Total acumulado en dataset: {total_acum} foto(s).\n"
                      "Vuelve a entrenar el modelo para aplicar los cambios.",
                 fg=GREEN)
@@ -377,42 +522,100 @@ def open_recognition_screen():
         return
 
     win = Toplevel(root)
-    win.title("Reconocimiento en vivo")
-    win.geometry("540x260")
+    win.title("Verificacion de asistencia")
+    win.geometry("620x400")
     win.configure(bg=BG)
     win.resizable(False, False)
 
-    make_header(win, "Reconocimiento en vivo")
+    make_header(win, "Verificacion por ID de estudiante")
     spacer(win)
 
-    Label(win,
-          text=f"Modelo cargado: {len(model)} persona(s)\n"
-               "Verde = reconocido  |  Rojo = desconocido\n"
-               "Presiona ESC para cerrar la camara.",
-          fg=WHITE, bg=BG, font=(FONT, 11), justify=CENTER).pack()
+    Label(win, text="ID del estudiante:", fg=WHITE, bg=BG, font=(FONT, 12)).pack()
+    claimed_id_var = StringVar()
+    Entry(win, textvariable=claimed_id_var, justify=CENTER, font=(FONT, 12), width=30).pack(ipady=5)
+    spacer(win)
+
+    info_text = f"""Modelo: {len(model)} ID(s)
+Criterios: 1 cara | Imagen nitida | S >= 70% | M >= 15%
+Consenso: {CONSENSUS_FRAMES} frames consecutivos validos
+ESC para cerrar"""
+
+    Label(win, text=info_text, fg=WHITE, bg=BG, font=(FONT, 10), justify=LEFT).pack()
     spacer(win)
     status = status_lbl(win)
 
     def run_recognition():
+        claimed_id = claimed_id_var.get().strip()
+        if not claimed_id:
+            status.config(text="Debes ingresar el ID del estudiante.", fg=RED)
+            return
+        if claimed_id not in model:
+            status.config(
+                text=f"El ID '{claimed_id}' no existe en el modelo. Registra y entrena primero.",
+                fg=RED,
+            )
+            return
+
         cap = cv2.VideoCapture(0)
+        setup_camera(cap)
         if not cap.isOpened():
             status.config(text="No se pudo abrir la camara.", fg=RED)
             return
-        status.config(text="Camara activa. ESC para detener.", fg=GREEN)
+        status.config(text=f"Camara activa para '{claimed_id}'. ESC para detener.", fg=GREEN)
         win.update()
+
+        consecutive_valid = 0  # Contador de frames consecutivos validos
+        attendance_marked = False
+        last_valid_score = 0.0
+        last_valid_margin = 0.0
 
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            predict(frame, model)
-            cv2.imshow("Reconocimiento Facial  (ESC=salir)", frame)
+
+            results = verify_claimed_id(frame, model, claimed_id)
+
+            # CONSENSO TEMPORAL: requiere CONSENSUS_FRAMES consecutivos validos
+            if results and len(results) > 0:
+                accepted, score, margin = results[0]
+                if accepted:
+                    consecutive_valid += 1
+                    last_valid_score = score
+                    last_valid_margin = margin
+                    cv2.putText(frame, f"Frames OK: {consecutive_valid}/{CONSENSUS_FRAMES}",
+                                (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, GREEN, 2)
+                else:
+                    consecutive_valid = 0
+            else:
+                consecutive_valid = 0
+
+            # MARCAR ASISTENCIA si se alcanza consenso
+            if consecutive_valid >= CONSENSUS_FRAMES and not attendance_marked:
+                msg.showinfo("Exito", f"ID '{claimed_id}'\nASISTENCIA REGISTRADA\n"
+                                      f"{consecutive_valid} frames validados")
+                # Registrar en BD
+                res = db.recordAttendance(
+                    claimed_id,
+                    last_valid_score,
+                    last_valid_margin,
+                    consecutive_valid,
+                    "OK"
+                )
+                if res["affected"]:
+                    print(f"[DB] Asistencia registrada: {claimed_id} (id={res['id']})")
+                attendance_marked = True
+
+            cv2.imshow("Verificacion Asistencia  (ESC=salir)", frame)
             if cv2.waitKey(1) == 27:
                 break
 
         cap.release()
         cv2.destroyAllWindows()
-        status.config(text="Reconocimiento detenido.", fg=YELLOW)
+        if not attendance_marked:
+            status.config(text="Reconocimiento cancelado.", fg=YELLOW)
+        else:
+            status.config(text=f"Asistencia de '{claimed_id}' OK.", fg=GREEN)
 
     styled_btn(win, "Iniciar reconocimiento", run_recognition, color="#1a3a6b").pack()
 
@@ -488,11 +691,11 @@ root.resizable(False, False)
 make_header(root, "Sistema de Asistencia Facial")
 spacer(root)
 
-styled_btn(root, "Registrar / Capturar rostros", open_capture_screen).pack()
+styled_btn(root, "Registrar estudiante (ID)", open_capture_screen).pack()
 spacer(root)
 styled_btn(root, "Entrenar modelo",              open_train_screen).pack()
 spacer(root)
-styled_btn(root, "Reconocimiento en vivo",       open_recognition_screen).pack()
+styled_btn(root, "Tomar asistencia (verificar ID)", open_recognition_screen).pack()
 spacer(root)
 styled_btn(root, "Gestion de usuarios (BD)",     open_users_screen).pack()
 spacer(root)
